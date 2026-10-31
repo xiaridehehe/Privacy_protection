@@ -126,7 +126,9 @@ class DeidentifierTests(unittest.TestCase):
             self.assertNotIn("Yan Jin", label)
             self.assertNotIn("2025113021288", label)
             self.assertNotIn("08 十月 1992", label)
-            self.assertNotIn("30 十一月 2025", label)
+            self.assertIn("检查日期:  30 十一月 2025", label)
+            self.assertIn("文件集创建时间:  27 八月 2026", label)
+            self.assertNotIn("[日期已保护]", label)
             self.assertIn("Synapse", label)
             self.assertTrue((patient_output / "preview.png").exists())
 
@@ -271,6 +273,58 @@ class DeidentifierTests(unittest.TestCase):
             clean = pydicom.dcmread(dst)
             self.assertIsNone(getattr(clean, "PixelData", None))
             self.assertEqual(clean.SpecificCharacterSet, "ISO_IR 192")
+
+
+class ContextIdentityTests(unittest.TestCase):
+    def test_department_bed_and_partial_doctor_names(self):
+        import medical_deidentifier as m
+        text = "科室:骨科六区(滨水新城)    床号:23->33    住院号:[xxxx]"
+        clean, _ = m.redact_text(text, "", "Patient_A1B2C3D4")
+        self.assertEqual(clean, "科室:xxxx    床号：xx    住院号:[xxxx]")
+        clean, _ = m.redact_text("唐[xxxx]主任医师，陈[xxxx]主治医师，魏[xxxx]医师", "", "Patient_A1B2C3D4")
+        self.assertEqual(clean, "[xxxx]主任医师，[xxxx]主治医师，[xxxx]医师")
+
+    def test_live_imaging_excel_upserts(self):
+        import medical_deidentifier as m
+        from openpyxl import load_workbook
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "checks.xlsx"
+            row = dict(patient_id="Patient_A1B2C3D4", source_file_hash="abc", findings="unknown", status="success")
+            m.save_imaging_check(path, row)
+            row["status"] = "review"
+            m.save_imaging_check(path, row)
+            wb = load_workbook(path)
+            self.assertEqual(wb.active.max_row, 2)
+            self.assertEqual(wb.active.cell(2, 4).value, "review")
+            self.assertEqual(wb.active.cell(1, 1).value, "Patient ID")
+            wb.close()
+
+    def test_admission_identity_and_unlabelled_staff_across_files(self):
+        import medical_deidentifier as m
+        from docx import Document
+        from openpyxl import Workbook
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            doc = Document()
+            doc.add_paragraph("姓     名：赵测试")
+            doc.add_paragraph("医师签名：钱示例")
+            doc.add_paragraph("参加人员（科室、姓名、职称）：孙示例、周示例主任医师")
+            doc.save(root / "入院记录.docx")
+            wb = Workbook()
+            wb.active.append(["护士签名", "吴示例"])
+            wb.save(root / "护理.xlsx")
+            ctx = m.build_identity_context(root, "错误目录名")
+            token = m.IDENTITY_CONTEXT.set(ctx)
+            try:
+                original = "赵测试由钱示例接诊，孙示例协助，吴示例记录。"
+                cleaned, _ = m.redact_text(original, "错误目录名", "Patient_A1B2C3D4")
+                self.assertEqual(cleaned, "Patient_A1B2C3D4由[xxxx]接诊，[xxxx]协助，[xxxx]记录。")
+                cleaned, _ = m.redact_text("婚     姻：已婚", "", "Patient_A1B2C3D4")
+                self.assertEqual(cleaned, "婚     姻：xx")
+                cleaned, _ = m.redact_text("第一助手:钱示例    第二助手:孙示例", "", "Patient_A1B2C3D4")
+                self.assertEqual(cleaned, "第一助手:[xxxx]    第二助手:[xxxx]")
+            finally:
+                m.IDENTITY_CONTEXT.reset(token)
 
 
 if __name__ == "__main__":

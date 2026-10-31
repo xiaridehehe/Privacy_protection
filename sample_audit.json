@@ -1,0 +1,72 @@
+[
+  {
+    "patient_id": "Patient_5382CE2D",
+    "files": 9,
+    "before": {
+      "科室原值": 6,
+      "床号原值": 6
+    },
+    "after": {
+      "科室原值": 0,
+      "床号原值": 0
+    },
+    "identity_read_failures": 0,
+    "scope": "原位内存规则复检，未覆盖已有数据；计数只覆盖科室和床号，不代表全面匿名化"
+  },
+  {
+    "patient_id": "Patient_5186A0C4",
+    "files": 9,
+    "before": {
+      "科室原值": 6,
+      "床号原值": 6
+    },
+    "after": {
+      "科室原值": 0,
+      "床号原值": 0
+    },
+    "identity_read_failures": 0,
+    "scope": "原位内存规则复检，未覆盖已有数据；计数只覆盖科室和床号，不代表全面匿名化"
+  },
+  {
+    "patient_id": "Patient_7A11D86E",
+    "files": 9,
+    "before": {
+      "科室原值": 6,
+      "床号原值": 6
+    },
+    "after": {
+      "科室原值": 0,
+      "床号原值": 0
+    },
+    "identity_read_failures": 0,
+    "scope": "原位内存规则复检，未覆盖已有数据；计数只覆盖科室和床号，不代表全面匿名化"
+  },
+  {
+    "patient_id": "Patient_0C2C87E0",
+    "files": 8,
+    "before": {
+      "科室原值": 4,
+      "床号原值": 4
+    },
+    "after": {
+      "科室原值": 0,
+      "床号原值": 0
+    },
+    "identity_read_failures": 0,
+    "scope": "原位内存规则复检，未覆盖已有数据；计数只覆盖科室和床号，不代表全面匿名化"
+  },
+  {
+    "patient_id": "Patient_52C4E002",
+    "files": 8,
+    "before": {
+      "科室原值": 5,
+      "床号原值": 5
+    },
+    "after": {
+      "科室原值": 0,
+      "床号原值": 0
+    },
+    "identity_read_failures": 0,
+    "scope": "原位内存规则复检，未覆盖已有数据；计数只覆盖科室和床号，不代表全面匿名化"
+  }
+]

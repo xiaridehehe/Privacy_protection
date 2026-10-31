@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextvars import ContextVar
 import hashlib
 import json
 import logging
@@ -167,6 +168,78 @@ class MappingStore:
             tmp.unlink(missing_ok=True)
 
 
+# Per-patient vocabulary, isolated from other patients and concurrent callers.
+IDENTITY_CONTEXT = ContextVar("identity_context", default=None)
+STAFF_LABEL = r"(?:医师签名|医生签名|记录者签名|手术者签名|术者签名|麻醉医师|手术者|第一助手|第二助手|洗手及巡回护士|责任护士|护士签名|评估者|评估人|复核者签名|复核者|审核者|审核人|签名)"
+
+
+def build_identity_context(folder: Path, fallback: str) -> dict:
+    texts, rows, admission = [], [], []
+    failures = 0
+    for path in sorted(folder.rglob("*")):
+        try:
+            values = []
+            if path.suffix.lower() == ".docx":
+                from docx import Document
+                doc = Document(path)
+                for container in walk_docx_containers(doc):
+                    values.extend(p.text for p in container.paragraphs)
+                    def table_values(tables):
+                        for table in tables:
+                            for row in table.rows:
+                                cells = [c.text for c in row.cells]
+                                rows.append(cells)
+                                values.extend(cells)
+                                for cell in row.cells:
+                                    table_values(cell.tables)
+                    table_values(container.tables)
+                if "入院记录" in path.stem:
+                    admission.extend(values)
+            elif path.suffix.lower() == ".xlsx":
+                wb = load_workbook(path, read_only=True, data_only=False)
+                for sheet in wb:
+                    for row in sheet.iter_rows(values_only=True):
+                        cells = [str(v) if v is not None else "" for v in row]
+                        rows.append(cells)
+                        values.extend(cells)
+                wb.close()
+            elif path.suffix.lower() in TEXT_EXTS:
+                values = [read_text(path)[0]]
+            texts.extend(values)
+        except Exception:
+            failures += 1
+    patient = fallback
+    for value in admission:
+        match = re.search(r"姓\s*名\s*[:：]\s*(?:[xX＊*]+)?([\u4e00-\u9fff]{2,5})(?=\s|$|[,，])", value)
+        if match:
+            patient = match[1]
+            break
+    names = set()
+    def add(value):
+        value = value.strip()
+        if re.fullmatch(r"[\u4e00-\u9fff]{2,5}", value) and not re.search(r"医师|医生|签名|护士|患者|本人|主任|主治|住院|今随|查房|记录|评估|科室|职称|手术|助手", value):
+            names.add(value)
+    for row in rows:
+        if any(re.fullmatch(r"\s*" + STAFF_LABEL + r"\s*[:：]?\s*", c) for c in row):
+            for cell in row:
+                for part in re.split(r"[、,，/\s]+", cell):
+                    add(part)
+    for value in texts:
+        for match in re.finditer(r"(?:^|[\s、，,（(：:]|今随|随|由)([\u4e00-\u9fff]{2,4}?)(?=(?:副主任|主任|主治|住院)?医[师生])", value):
+            add(match[1])
+        for match in re.finditer(STAFF_LABEL + r"\s*[:：]\s*([\u4e00-\u9fff]{2,10})", value):
+            candidate = match[1]
+            if len(candidate) % 2 == 0 and candidate[:len(candidate)//2] == candidate[len(candidate)//2:]:
+                candidate = candidate[:len(candidate)//2]
+            add(candidate)
+        if re.match(r"\s*(参加人员|讨论主持者)", value):
+            tail = re.split(r"[:：]", value, maxsplit=1)[-1]
+            for part in re.split(r"[、,，\s]+", tail):
+                add(re.sub(r"(?:副?主任|主治|住院)?医[师生].*$", "", part))
+    names.discard(patient)
+    return {"patient": patient, "names": names, "failures": failures}
+
+
 def redact_text(text: str, patient_name: str, patient_id: str) -> tuple[str, list[Finding]]:
     findings: list[Finding] = []
 
@@ -178,17 +251,53 @@ def redact_text(text: str, patient_name: str, patient_id: str) -> tuple[str, lis
             findings.append(Finding(kind, f"已处理 {count} 处"))
         return text
 
+    context = IDENTITY_CONTEXT.get()
+    if context:
+        patient_name = context["patient"]
+        for other in sorted(context["names"], key=len, reverse=True):
+            sub(re.compile(re.escape(other)), "[xxxx]", "其他人员姓名", "")
+        for other in sorted(context["names"], key=len, reverse=True):
+            if len(other) == 3:
+                sub(re.compile(re.escape(other[1:]) + r"(?=(?:副?主任|主治|住院)?医[师生])"), "[xxxx]", "人员简称", "")
+    sub(re.compile(r"[赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦许何吕施张孔曹严华金魏陶姜谢邹喻柏窦章苏潘葛范彭鲁韦马苗方俞任袁柳唐罗薛雷贺倪汤滕殷陆汪董梁杜阮蓝闵席季麻强贾路娄江童颜郭梅盛林钟徐邱骆高夏蔡田胡凌霍虞万卢莫房解应宗丁宣邓郁单杭洪包左石崔吉龚程邢裴陆荣翁荀羊甄曲封芮储靳段富焦侯宁武刘景詹龙叶白蒲庄向古易廖文曾谭肖熊岳尹]\[xxxx\](?=(?:副?主任|主治|住院)?医[师生])"), "[xxxx]", "医护姓氏残留", "")
+    # Keep clinical dates and measurements intact; redact only identity fields.
+    field_labels = r"诊断|性\s*别|年\s*龄|科室|床号|病区|入院日期|入院时间|姓\s*名|病人姓名|患者姓名|出生日期|出生年月|出生时间|出生地|民族|职业|婚\s*姻|家庭住址|现住址|户籍地址|联系地址|住址|地址|联系电话|电话|手机|电子邮件|邮箱|身份证号|身份证|病案号|住院号|门诊号|医生|医师|机构|医院"
+    boundary = rf"(?=\s+(?:{field_labels})\s*[:：]|[,，;；\r\n]|$)"
+    def field(labels, replacement, kind):
+        pattern = re.compile(rf"((?:{labels})\s*[:：]\s*)[^,，;；\r\n]+?" + boundary, re.I)
+        sub(pattern, lambda m: m[1] + replacement, kind, "")
+
+    # Names matching the patient's identity become the stable Patient ID.
     if patient_name and not PID_RE.fullmatch(patient_name) and len(patient_name.strip()) >= 2:
-        pattern = re.compile(re.escape(patient_name.strip()), re.I)
-        sub(pattern, patient_id, "患者姓名", patient_name)
-    sub(LABELED_NAME_RE, rf"\1：{patient_id}", "患者姓名字段", "")
-    sub(LABELED_DATE_RE, r"\1：[日期已保护]", "日期字段", "")
-    sub(ID_CARD_RE, "[身份证号已删除]", "身份证号", "")
-    sub(PHONE_RE, "[联系电话已删除]", "手机号", "")
-    sub(LANDLINE_RE, "[联系电话已删除]", "联系电话", "")
-    sub(LABELED_ID_RE, lambda_placeholder("标识", patient_id), "原始患者标识", "")
-    sub(ADDRESS_RE, r"\1：[地址已删除]", "地址", "")
-    sub(BIRTH_RE, r"\1：[出生日期已删除]", "出生日期", "")
+        sub(re.compile(re.escape(patient_name.strip()), re.I), patient_id, "患者姓名", "")
+    name_pattern = re.compile(rf"((?:姓\s*名|病人姓名|患者姓名|patient\s*name)\s*[:：]\s*)([^,，;；\r\n]+?)" + boundary, re.I)
+    sub(name_pattern, lambda m: m[1] + (patient_id if patient_id in m[2] else "[xxxx]"), "姓名字段", "")
+    field(r"出生日期|出生年月|出生时间|date\s*of\s*birth|DOB", "xxxx-xx-xx", "出生日期")
+    for labels, replacement in [
+        ("科室|病区", "xxxx"),
+        ("出生地|民族|职业", "xxxx"), (r"婚\s*姻", "xx"),
+        ("家庭住址|现住址|户籍地址|联系地址|住址", "xxxxx"),
+        ("地址", "xxxx"), ("联系电话|电话|手机", "xxx-xxxx-xxxx"),
+        ("电子邮件|邮箱|email", "xxxx@xxx.com"),
+        ("机构|医疗机构|医院|工作单位|单位", "xxxx"),
+        ("身份证号|身份证|病案号|住院号|门诊号|患者编号|病历号|医保卡号|社保卡号|ID", "[xxxx]"),
+        ("联系人|家属姓名", "[xxxx]"),
+    ]:
+        field(labels, replacement, labels)
+    sub(re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "xxxx@xxx.com", "电子邮件", "")
+    sub(ID_CARD_RE, "[xxxx]", "身份证号", "")
+    sub(PHONE_RE, "xxx-xxxx-xxxx", "手机号", "")
+    sub(LANDLINE_RE, "xxx-xxxx-xxxx", "联系电话", "")
+    sub(LABELED_ID_RE, r"\1：[xxxx]", "原始患者标识", "")
+
+    sub(re.compile(r"湘雅附[一二三123]院?"), "xxxx", "机构简称", "")
+    # Match only the name after a role label, preserving adjacent roles/text.
+    sub(re.compile(r"(" + STAFF_LABEL + r"\s*[:：]\s*)([\u4e00-\u9fff]{2,5})(?=\s|$|[、,，;；])"), r"\1[xxxx]", "人员姓名字段", "")
+    sub(re.compile(r"床号\s*[:：]\s*[^\s,，;；\r\n]+"), "床号：xx", "床号", "")
+    sub(re.compile(r"骨科六区(?:[（(]滨水新城[）)])?|骨六科"), "xxxx", "科室名称", "")
+    # Full organization names and geographic addresses can occur inside prose.
+    sub(re.compile(r"[\u4e00-\u9fff]{2,24}(?:医院|卫生院|卫生服务中心|医疗中心)(?:[（(][^）)\r\n]{1,20}[）)])?"), "xxxx", "机构名称", "")
+    sub(re.compile(r"[\u4e00-\u9fff]{2,8}省[\u4e00-\u9fff0-9]{2,60}(?:号|村|镇|区|市|县)"), "xxxx", "正文地址", "")
     return text, findings
 
 
@@ -243,6 +352,11 @@ def process_plain(src: Path, dst: Path, name: str, pid: str) -> Result:
     if residual:
         return Result("review", findings + [Finding("残留复扫", ",".join(residual))])
     return Result("success", findings)
+
+
+def process_imaging_label(src: Path, dst: Path, name: str, pid: str) -> Result:
+    # Clinical/media creation dates in LABEL.TXT are intentionally retained.
+    return process_plain(src, dst, name, pid)
 
 
 def process_csv(src: Path, dst: Path, name: str, pid: str) -> Result:
@@ -678,7 +792,9 @@ def _process_dicom_impl(src: Path, dst: Path, name: str, pid: str, uid_mapper: U
     ds.file_meta = clean_meta
     burned = str(getattr(ds, "BurnedInAnnotation", "")).upper()
     if "PixelData" in ds and burned != "NO":
-        findings.append(Finding("像素数据", "按业务规则保持不变，未检查或修改烧录文字"))
+        findings.append(Finding("烧录文字检查", "标签声明存在烧录文字；像素保持不变，待人工判断" if burned == "YES" else "标签缺失或未知，无法确定是否有烧录文字；像素保持不变，待人工查看"))
+    elif "PixelData" in ds:
+        findings.append(Finding("烧录文字检查", "标签声明无烧录文字（未进行像素OCR验证）；像素保持不变"))
     if src.name.upper() == "DICOMDIR" or getattr(ds, "DirectoryRecordSequence", None):
         findings.append(Finding("DICOMDIR", "已清理目录记录中的身份标签并完成写后读取验证"))
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -814,7 +930,42 @@ def safe_exception_detail(exc: Exception) -> str:
     return f"{type(exc).__name__} at {Path(frame.filename).name}:{frame.lineno} in {frame.name}{tag}"
 
 
+def save_imaging_check(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = load_workbook(path) if path.exists() else Workbook()
+    ws = wb.active
+    if ws.cell(1, 1).value is None:
+        ws.append(["Patient ID", "源文件哈希", "检查结果", "处理状态"])
+        # Remove the initially blank row created by cell access.
+        ws.delete_rows(1)
+    key = (row["patient_id"], row["source_file_hash"])
+    target = next((i for i, values in enumerate(ws.iter_rows(min_row=2, values_only=True), 2)
+                   if values[:2] == key), ws.max_row + 1)
+    values = [*key, row["findings"], row["status"]]
+    for col, value in enumerate(values, 1):
+        ws.cell(target, col, value)
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", dir=path.parent, delete=False) as f:
+        temp = Path(f.name)
+    try:
+        wb.save(temp)
+        os.replace(temp, path)
+    finally:
+        wb.close()
+        temp.unlink(missing_ok=True)
+
+
 def process_patient(folder: Path, input_root: Path, output_root: Path, mode: str, name: str, pid: str,
+                    key: str, uid_mapper: UIDMapper, log: logging.Logger) -> list[dict]:
+    context = build_identity_context(folder, name) if mode == "records" else None
+    token = IDENTITY_CONTEXT.set(context)
+    try:
+        return _process_patient(folder, input_root, output_root, mode,
+                                context["patient"] if context else name, pid, key, uid_mapper, log)
+    finally:
+        IDENTITY_CONTEXT.reset(token)
+
+
+def _process_patient(folder: Path, input_root: Path, output_root: Path, mode: str, name: str, pid: str,
                     key: str, uid_mapper: UIDMapper, log: logging.Logger) -> list[dict]:
     rows: list[dict] = []
     share_root = output_root / "share_ready" / pid
@@ -843,7 +994,7 @@ def process_patient(folder: Path, input_root: Path, output_root: Path, mode: str
                 if src.suffix.lower() in IMAGE_EXTS:
                     tmp_dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, tmp_dst)
-                    result = Result("success", [Finding("安全图像", "按业务规则原样复制，未处理图像内容")])
+                    result = Result("success", [Finding("烧录文字检查", "普通图像原样复制；尚未进行OCR，是否存在文字需人工查看")])
                 elif processor is None or src.suffix.lower() in UNSAFE_EXTS:
                     review_dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, review_dst)
@@ -856,7 +1007,7 @@ def process_patient(folder: Path, input_root: Path, output_root: Path, mode: str
                 is_dicomdir = src.name.upper() == "DICOMDIR"
                 in_dicomobj = "DICOMOBJ" in upper_parts
                 if is_label:
-                    result = process_plain(src, tmp_dst, name, pid)
+                    result = process_imaging_label(src, tmp_dst, name, pid)
                 elif is_dicomdir or in_dicomobj:
                     if not looks_like_dicom(src):
                         raise ValueError("DICOMOBJ/DICOMDIR 中存在不可读取的 DICOM 文件")
@@ -867,6 +1018,9 @@ def process_patient(folder: Path, input_root: Path, output_root: Path, mode: str
                     tmp_dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, tmp_dst)
                     result = Result("success", [Finding("非隐私目标文件", "按业务规则逐字节原样复制")])
+            if mode == "records" and IDENTITY_CONTEXT.get() and IDENTITY_CONTEXT.get()["failures"]:
+                result.status = "review"
+                result.findings.append(Finding("身份词表不完整", "部分文件无法读取，需人工核对无标签姓名"))
             if filename_risk:
                 result.status = "review"
                 result.findings.append(Finding("文件名残留风险", "需人工复核"))
@@ -901,6 +1055,8 @@ def process_patient(folder: Path, input_root: Path, output_root: Path, mode: str
                 log.error("文件处理失败 patient=%s file_hash=%s error=%s", pid, source_hash, diagnostic)
         finally:
             tmp_dst.unlink(missing_ok=True)
+        if mode == "dicom" and rows:
+            save_imaging_check(output_root / "burned_in_annotation_checks.xlsx", rows[-1])
     if mode == "dicom" and dicom_failed and share_root.exists():
         # Patient-level transaction rule: every item under the image folder must
         # succeed; one failed/review item prevents the whole set from sharing.
@@ -918,6 +1074,8 @@ def process_patient(folder: Path, input_root: Path, output_root: Path, mode: str
                 if row["status"] == "success":
                     row["status"] = "review"
                 row["findings"] += "; 患者级影像事务:目录内存在未成功文件，整组不得进入share_ready"
+        for row in rows:
+            save_imaging_check(output_root / "burned_in_annotation_checks.xlsx", row)
         log.error("患者影像整组未通过 patient=%s；目录内至少一个文件未成功", pid)
     return rows
 
